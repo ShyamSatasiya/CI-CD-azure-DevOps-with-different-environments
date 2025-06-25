@@ -1,0 +1,160 @@
+trigger:
+  branches:
+    include:
+      - master
+  paths:
+    include:
+      - '*'
+    exclude:
+      - infra/*  # Terraform won't run unless explicitly triggered
+
+stages:
+# ------------------------
+# 0. Terraform Provision
+# ------------------------
+- stage: TerraformProvision
+  displayName: 'Terraform: Provision Infra'
+  condition: |
+    or(
+      startsWith(variables['Build.SourceBranch'], 'refs/heads/master'),
+      startsWith(variables['Build.SourceBranch'], 'refs/heads/main')
+    )
+  jobs:
+    - job: TerraformJob
+      displayName: 'Terraform Apply'
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - checkout: self
+
+        - script: |
+            curl -s -o terraform.zip https://releases.hashicorp.com/terraform/1.7.5/terraform_1.7.5_linux_amd64.zip
+            unzip terraform.zip
+            sudo mv terraform /usr/local/bin/
+            terraform -version
+          displayName: 'Install Terraform CLI'
+
+        - script: terraform -chdir=infra init
+          displayName: 'Terraform Init'
+
+        - script: terraform -chdir=infra plan -out=tfplan
+          displayName: 'Terraform Plan'
+
+        - script: terraform -chdir=infra apply -auto-approve tfplan
+          displayName: 'Terraform Apply'
+
+# ------------------------
+# 1. Build Stage
+# ------------------------
+- stage: Build
+  displayName: 'Build and Publish'
+  dependsOn: TerraformProvision
+  condition: succeeded()
+  jobs:
+    - job: BuildJob
+      steps:
+        - task: UseDotNet@2
+          inputs:
+            packageType: 'sdk'
+            version: '9.0.301'
+
+        - task: DotNetCoreCLI@2
+          inputs:
+            command: 'restore'
+            projects: '**/*.csproj'
+
+        - task: DotNetCoreCLI@2
+          inputs:
+            command: 'build'
+            projects: '**/*.csproj'
+            arguments: '--configuration $(buildConfiguration)'
+
+        - task: DotNetCoreCLI@2
+          inputs:
+            command: 'test'
+            projects: '**/*Tests.csproj'
+
+        - task: DotNetCoreCLI@2
+          inputs:
+            command: 'publish'
+            publishWebProjects: true
+            arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)'
+            zipAfterPublish: true
+
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+            ArtifactName: 'drop'
+            publishLocation: 'Container'
+
+# ------------------------
+# 2. Deploy to Dev
+# ------------------------
+- stage: DeployDev
+  displayName: 'Deploy to Dev'
+  dependsOn: Build
+  jobs:
+    - deployment: DevDeployment
+      displayName: 'Dev Deployment'
+      environment: 'development'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - download: current
+                artifact: drop
+
+              - task: AzureWebApp@1
+                inputs:
+                  azureSubscription: 'Azure subscription 1(c36f74e0-d286-4b5f-8133-5e730bb31a23)'
+                  appType: 'webApp'
+                  appName: 'bootcamp-webapp-dev'
+                  package: '$(Pipeline.Workspace)/drop/**/*.zip'
+
+# ------------------------
+# 3. Deploy to Staging
+# ------------------------
+- stage: DeployStaging
+  displayName: 'Deploy to Staging'
+  dependsOn: DeployDev
+  jobs:
+    - deployment: StagingDeployment
+      displayName: 'Staging Deployment'
+      environment: 'staging'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - download: current
+                artifact: drop
+
+              - task: AzureWebApp@1
+                inputs:
+                  azureSubscription: 'Azure subscription 1(c36f74e0-d286-4b5f-8133-5e730bb31a23)'
+                  appType: 'webApp'
+                  appName: 'bootcamp-webapp-staging'
+                  package: '$(Pipeline.Workspace)/drop/**/*.zip'
+
+# ------------------------
+# 4. Deploy to Production (with Manual Approval)
+# ------------------------
+- stage: DeployProd
+  displayName: 'Deploy to Production'
+  dependsOn: DeployStaging
+  jobs:
+    - deployment: ProdDeployment
+      displayName: 'Production Deployment'
+      environment: 'production'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - download: current
+                artifact: drop
+
+              - task: AzureWebApp@1
+                inputs:
+                  azureSubscription: 'Azure subscription 1(c36f74e0-d286-4b5f-8133-5e730bb31a23)'
+                  appType: 'webApp'
+                  appName: 'bootcamp-webapp-prod'
+                  package: '$(Pipeline.Workspace)/drop/**/*.zip'
